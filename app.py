@@ -4,16 +4,30 @@ import httpx
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageOps
-from rembg import new_session, remove
+import numpy as np
+import onnxruntime as ort
 
-MODEL = os.environ.get("BG_MODEL", "u2netp")  # Apache-2.0 (U-2-Net), run through rembg (MIT)
+MODEL = "u2netp"  # U-2-Net-p, Apache-2.0 (https://github.com/xuebinqin/U-2-Net); weights from the rembg release assets
+MODEL_PATH = os.environ.get("MODEL_PATH", os.path.expanduser("~/.u2net/u2netp.onnx"))
 MAX_BYTES = int(os.environ.get("MAX_BYTES", 10 * 1024 * 1024))
 MAX_SIDE = int(os.environ.get("MAX_SIDE", 4096))
 WORK_SIDE = int(os.environ.get("WORK_SIDE", 1024))  # larger inputs are processed at this size, mask scaled back
 SECRETS = {k: v for k, v in (("rapidapi", os.environ.get("PROXY_SECRET", "")),
                              ("apimarket", os.environ.get("PROXY_SECRET_APIMARKET", "")),
                              ("zyla", os.environ.get("PROXY_SECRET_ZYLA", ""))) if v}
-session = new_session(MODEL)
+_so = ort.SessionOptions(); _so.intra_op_num_threads = 1; _so.enable_mem_pattern = False; _so.enable_cpu_mem_arena = False
+session = ort.InferenceSession(MODEL_PATH, sess_options=_so, providers=["CPUExecutionProvider"])
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32); _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def predict_mask(rgb):
+    """rembg-compatible u2netp preprocessing: 320x320, scale by max, ImageNet normalise; output min-max normalised."""
+    x = np.asarray(rgb.resize((320, 320), Image.LANCZOS), dtype=np.float32)
+    x = x / max(float(x.max()), 1e-6)
+    x = ((x - _MEAN) / _STD).transpose(2, 0, 1)[None].astype(np.float32)
+    p = session.run(None, {session.get_inputs()[0].name: x})[0][0, 0]
+    p = (p - p.min()) / max(float(p.max() - p.min()), 1e-6)
+    return Image.fromarray((p * 255).astype(np.uint8)).resize(rgb.size, Image.LANCZOS)
 app = FastAPI(title="Background Removal API", docs_url=None, redoc_url=None, openapi_url=None)
 
 
@@ -91,7 +105,7 @@ async def remove_bg(req: Request, image: UploadFile = File(None), image_url: str
     if max(w, h) > WORK_SIDE:
         s = WORK_SIDE / max(w, h)
         work = im.resize((max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS)
-    mask = remove(work.convert("RGB"), session=session, only_mask=True)
+    mask = predict_mask(work.convert("RGB"))
     if mask.size != im.size:
         mask = mask.resize(im.size, Image.LANCZOS)
     out = im.copy()
