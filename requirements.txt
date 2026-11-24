@@ -1,0 +1,8 @@
+rembg
+onnxruntime
+fastapi
+uvicorn
+python-multipart
+httpx
+pillow
+numpy
